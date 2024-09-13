@@ -224,15 +224,15 @@ class SpecAug(SpecAugmentTorch):
         return x.squeeze(1).permute(0, 2, 1)
 
 
-class Conformer(torch.nn.Module):
+class Encoder(torch.nn.Module):
 
-    def __init__(self, num_blocks):
+    def __init__(self):
         super().__init__()
 
         self.spec_aug = SpecAug()
         self.linear = torch.nn.Linear(in_features=config.d_features, out_features=config.params['d_encoder'])
         self.dropout = torch.nn.Dropout(p=config.p_drop) 
-        self.blocks = torch.nn.Sequential(*[ConformerBlock() for _ in range(num_blocks)])
+        self.blocks = torch.nn.Sequential(*[ConformerBlock() for _ in range(config.params['num_encoder_layers'])])
 
     def forward(self, x):
         x = self.spec_aug(x)
@@ -243,16 +243,52 @@ class Conformer(torch.nn.Module):
         return x
 
 
+class Decoder(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+        self.lstm = torch.nn.LSTM(
+            input_size=config.params['d_encoder'],
+            hidden_size=config.params['d_decoder'],
+            num_layers=config.params['num_decoder_layers'],
+            bias=True,
+            bidirectional=False,
+            dropout=config.p_drop
+        )
+
+    def forward(self, x):
+        output, (hidden_state, cell_state) = self.lstm(x)
+
+        return output
+
+
+class E2E(torch.nn.Module):
+    
+    def __init__(self):
+        super().__init__()
+
+        self.encoder = Encoder()
+        self.decoder = Decoder()
+
+    def forward(self, x):
+        encoder_out = self.encoder(x)
+        
+        return self.decoder(encoder_out)
+
+
 def main():
     batch_size, num_timesteps = 4, 100
     x = torch.rand((batch_size, num_timesteps, config.d_features))
 
-    model = Conformer(num_blocks=config.params['num_encoder_layers'])
+    model = E2E()
     
     num_params = sum(p.numel() for p in model.parameters())
     print(f'Model {config.model_size}: {num_params} total params')
-
+    
+    print(f'Input: {x.shape}')
     output = model(x)
+    print(f'Output: {output.shape}')
     
 
 if __name__ == '__main__':
