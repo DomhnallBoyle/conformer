@@ -1,8 +1,8 @@
 import os
 
-d_attn = os.environ.get('ATTN_DIM', 64)
 d_features = 80
 max_len = 5000
+p_drop = 0.1
 model_size = os.environ.get('MODEL_SIZE', 's')
 params_d = {
     's': {
@@ -10,7 +10,8 @@ params_d = {
         'num_encoder_layers': 16,
         'd_encoder': 144,
         'num_attn_heads': 4,
-        'conv_kernel_size': 32,
+        'd_attn': 36,
+        'conv_kernel_size': 31,
         'num_decoder_layers': 1,
         'd_decoder': 320
     },
@@ -19,7 +20,8 @@ params_d = {
         'num_encoder_layers': 16,
         'd_encoder': 256,
         'num_attn_heads': 4,
-        'conv_kernel_size': 32,
+        'd_attn': 64,
+        'conv_kernel_size': 31,
         'num_decoder_layers': 1,
         'd_decoder': 640
     },
@@ -28,7 +30,8 @@ params_d = {
         'num_encoder_layers': 17,
         'd_encoder': 512,
         'num_attn_heads': 8,
-        'conv_kernel_size': 32,
+        'd_attn': 64,
+        'conv_kernel_size': 31,
         'num_decoder_layers': 1,
         'd_decoder': 640
     }

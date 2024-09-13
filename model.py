@@ -3,7 +3,18 @@ import math
 import torch
 
 import config
-from utils import spec_augment
+from spec_aug import SpecAugmentTorch
+
+
+class PermuteLayer(torch.nn.Module):
+    
+    def __init__(self, dims):
+        super().__init__()
+
+        self.dims = dims
+
+    def forward(self, x):
+        return x.permute(*self.dims)
 
 
 class ConvolutionModule(torch.nn.Module):
@@ -11,18 +22,21 @@ class ConvolutionModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
+        self.num_features = config.params['d_encoder']
         self.expansion_factor = 2
-        self.expansion = config.d_features * self.expansion_factor
+        self.expansion = self.num_features * self.expansion_factor
 
         self.nn = torch.nn.Sequential(
-            torch.nn.LayerNorm(normalized_shape=config.d_features),
-            torch.nn.Conv1d(in_channels=config.d_features, out_channels=self.expansion, kernel_size=1),  # point-wise conv
-            torch.nn.GLU(),
-            torch.nn.Conv1d(in_channels=self.expansion, out_channels=self.expansion, kernel_size=config.params['conv_kernel_size']),  # depth-wise conv
-            torch.nn.BatchNorm1d(num_features=self.expansion),
+            torch.nn.LayerNorm(normalized_shape=self.num_features),
+            PermuteLayer(dims=(0, 2, 1)),
+            torch.nn.Conv1d(in_channels=self.num_features, out_channels=self.expansion, kernel_size=1, stride=1, padding=0, bias=True),  # point-wise conv
+            torch.nn.GLU(dim=1),
+            torch.nn.Conv1d(in_channels=self.num_features, out_channels=self.num_features, kernel_size=config.params['conv_kernel_size'], stride=1, padding=(config.params['conv_kernel_size']) // 2, bias=False),  # depth-wise conv
+            torch.nn.BatchNorm1d(num_features=self.num_features),
             torch.nn.SiLU(),  # swish
-            torch.nn.Conv1d(in_channels=self.expansion, out_channels=config.d_features, kernel_size=1),  # point-wise conv
-            torch.nn.Dropout()
+            torch.nn.Conv1d(in_channels=self.num_features, out_channels=self.num_features, kernel_size=1, stride=1, padding=0, bias=True),  # point-wise conv
+            torch.nn.Dropout(p=config.p_drop),
+            PermuteLayer(dims=(0, 2, 1))
         )
 
     def forward(self, x):
@@ -38,9 +52,9 @@ class ScaledDotProductAttention(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.scale = 1 / math.sqrt(config.d_attn)
+        self.scale = 1 / math.sqrt(config.params['d_attn'])
 
-    def forward(self, Q, K, V):
+    def forward(self, Q, K, V, attn_mask=None):
         x = Q @ K.transpose(-2, -1)  # matrix dot product, swap dims of value
         x *= self.scale  # prevents small gradients from softmax
         if attn_mask is not None:
@@ -56,22 +70,23 @@ class MultiHeadAttention(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
+        self.num_features = config.params['d_encoder']
         self.linear_projs_in = torch.nn.ModuleList([
             torch.nn.ModuleList([
-                torch.nn.Linear(in_features=config.params['d_encoder'], out_features=config.d_attn),  # Q
-                torch.nn.Linear(in_features=config.params['d_encoder'], out_features=config.d_attn),  # K
-                torch.nn.Linear(in_features=config.params['d_encoder'], out_features=config.d_attn),  # V
+                torch.nn.Linear(in_features=self.num_features, out_features=config.params['d_attn']),  # Q
+                torch.nn.Linear(in_features=self.num_features, out_features=config.params['d_attn']),  # K
+                torch.nn.Linear(in_features=self.num_features, out_features=config.params['d_attn']),  # V
             ])
             for _ in range(config.params['num_attn_heads'])
         ])
         self.sdpa = ScaledDotProductAttention()
-        self.linear_out = torch.nn.Linear(in_features=config.d_features, out_features=config.d_features)
+        self.linear_out = torch.nn.Linear(in_features=self.num_features, out_features=self.num_features)
 
     def forward(self, Q, K, V):
         batch_size, num_timesteps = Q.shape[:2]
 
         # temp matrices
-        Q_all = torch.zeros((batch_size, config.params['num_attn_heads'], num_timesteps, config.d_attn))
+        Q_all = torch.zeros((batch_size, config.params['num_attn_heads'], num_timesteps, config.params['d_attn']))
         K_all = torch.zeros_like(Q_all)
         V_all = torch.zeros_like(Q_all)
 
@@ -81,9 +96,9 @@ class MultiHeadAttention(torch.nn.Module):
             V_all[:, i, ...] = self.linear_projs_in[i][2](V)
 
         x = self.sdpa(Q_all, K_all, V_all)  # parallel
-        x = x.view(batch_size, num_timesteps, config.d_attn * config.params['num_attn_heads'])  # concat from attn heads
+        x = x.view(batch_size, num_timesteps, config.params['d_attn'] * config.params['num_attn_heads'])  # concat from attn heads
         x = self.linear_out(x)
-        x = torch.functional.dropout(x, p=None, training=True)
+        x = torch.nn.functional.dropout(x, p=config.p_drop, training=True)
 
         return x
         
@@ -112,7 +127,7 @@ class MultiHeadSelfAttentionModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.layer_norm = torch.nn.LayerNorm(normalized_shape=config.d_features)
+        self.layer_norm = torch.nn.LayerNorm(normalized_shape=config.params['d_encoder'])
         self.pe_layer = PositionalEncoding()
         self.mha = MultiHeadAttention()
 
@@ -131,16 +146,17 @@ class FeedForwardModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
+        self.num_features = config.params['d_encoder']
         self.expansion_factor = 4
-        self.expansion = config.d_features * self.expansion_factor
+        self.expansion = self.num_features * self.expansion_factor
 
         self.nn = torch.nn.Sequential(
-            torch.nn.LayerNorm(normalized_shape=config.d_features),
-            torch.nn.Linear(in_features=config.d_features, out_features=self.expansion),
+            torch.nn.LayerNorm(normalized_shape=self.num_features),
+            torch.nn.Linear(in_features=self.num_features, out_features=self.expansion),
             torch.nn.SiLU(),  # swish
-            torch.nn.Dropout(),
-            torch.nn.Linear(in_features=self.expansion, out_features=config.d_features),
-            torch.nn.Dropout()
+            torch.nn.Dropout(p=config.p_drop),
+            torch.nn.Linear(in_features=self.expansion, out_features=self.num_features),
+            torch.nn.Dropout(p=config.p_drop)
         )
 
     def forward(self, x):
@@ -160,7 +176,7 @@ class ConformerBlock(torch.nn.Module):
         self.mhsa = MultiHeadSelfAttentionModule()
         self.conv = ConvolutionModule()
         self.ff_2 = FeedForwardModule()
-        self.layer_norm = torch.nn.LayerNorm(normalized_shape=config.d_features)
+        self.layer_norm = torch.nn.LayerNorm(normalized_shape=config.params['d_encoder'])
 
     def forward(self, x):
         x_init = x
@@ -181,51 +197,48 @@ class ConformerBlock(torch.nn.Module):
         return x
         
 
-class SpecAug(torch.nn.Module):
+class SpecAug(SpecAugmentTorch):
 
     # spec-aug modifies the spectrogram by warping in the time direction,
     # masking blocks of consecutive frequency channels
     # and masking blocks of utterances in time
     # helps network be more robust to time deformations and partial loss of frequency and segments of speech
 
+    # TODO: find the correct params for Spec Augment
+
     def __init__(self):
-        super().__init__()
+        super().__init__(**{
+            'W': 5,  # time warping param
+            'F': config.frequency_mask,  # frequency masking param
+            'T': 0.05,  # time masking param
+            'mF': 1,  # frequency mask num
+            'mT': config.num_time_masks,  # time mask num
+            'batch': True
+        })
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1).unsqueeze(1)
 
-        # TODO: use this implementation instead - https://github.com/IMLHF/SpecAugmentPyTorch
-        #  supports batches
+        x = super().forward(spec_batch=x)
 
-        x = spec_augment(
-            mel_spectrogram=x,
-            time_warping_para=5,
-            frequency_masking_para=config.frequency_mask,
-            time_mask_num=config.num_time_masks
-        )
-
-        return x.permute(0, 2, 1)
+        return x.squeeze(1).permute(0, 2, 1)
 
 
 class Conformer(torch.nn.Module):
-
-    # TODO: how do we get d_encoder from d_features?
 
     def __init__(self, num_blocks):
         super().__init__()
 
         self.spec_aug = SpecAug()
         self.linear = torch.nn.Linear(in_features=config.d_features, out_features=config.params['d_encoder'])
-        self.dropout = torch.nn.Dropout()
-        self.blocks = [ConformerBlock()] * num_blocks
+        self.dropout = torch.nn.Dropout(p=config.p_drop) 
+        self.blocks = torch.nn.Sequential(*[ConformerBlock() for _ in range(num_blocks)])
 
     def forward(self, x):
         x = self.spec_aug(x)
         x = self.linear(x)
         x = self.dropout(x)
-
-        for conformer_block in self.blocks:
-            x = conformer_block(x)
+        x = self.blocks(x)
 
         return x
 
@@ -234,10 +247,13 @@ def main():
     batch_size, num_timesteps = 4, 100
     x = torch.rand((batch_size, num_timesteps, config.d_features))
 
-    model = Conformer(num_blocks=2)
-    output = model(x)
-    print(output.shape)
+    model = Conformer(num_blocks=config.params['num_encoder_layers'])
+    
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f'Model {config.model_size}: {num_params} total params')
 
+    output = model(x)
+    
 
 if __name__ == '__main__':
     main()
