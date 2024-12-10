@@ -38,8 +38,12 @@ params_d = {
 }
 params = params_d.get(model_size, 's')
 
+# mel filterbanks
+window_size = 400  # 25ms window
+stride = 160  # 10ms hop
+num_mels = d_features
+
 # spec-aug
 num_time_masks = 10
 frequency_mask = 27
 max_time_mask_ratio = 0.05  # mask max size = this * utterance length
-

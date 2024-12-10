@@ -1,10 +1,14 @@
 import math
 
 import torch
+import torchaudio
 
 import config
 from spec_aug import SpecAugmentTorch
 
+
+# TODO: 
+# Use this SpecAugment instead: https://pytorch.org/audio/master/tutorials/audio_feature_augmentation_tutorial.html#specaugment
 
 class PermuteLayer(torch.nn.Module):
     
@@ -197,31 +201,54 @@ class ConformerBlock(torch.nn.Module):
         return x
         
 
-class SpecAug(SpecAugmentTorch):
+# class SpecAug(SpecAugmentTorch):
 
-    # spec-aug modifies the spectrogram by warping in the time direction,
-    # masking blocks of consecutive frequency channels
-    # and masking blocks of utterances in time
-    # helps network be more robust to time deformations and partial loss of frequency and segments of speech
+#     # spec-aug modifies the spectrogram by warping in the time direction,
+#     # masking blocks of consecutive frequency channels
+#     # and masking blocks of utterances in time
+#     # helps network be more robust to time deformations and partial loss of frequency and segments of speech
 
-    # TODO: find the correct params for Spec Augment
+#     # TODO: find the correct params for Spec Augment
+
+#     def __init__(self):
+#         super().__init__(**{
+#             'W': 5,  # time warping param
+#             'F': config.frequency_mask,  # frequency masking param
+#             'T': 0.05,  # time masking param
+#             'mF': 1,  # frequency mask num
+#             'mT': config.num_time_masks,  # time mask num
+#             'batch': True
+#         })
+
+#     def forward(self, x):
+#         x = x.permute(0, 2, 1).unsqueeze(1)
+
+#         x = super().forward(spec_batch=x)
+
+#         return x.squeeze(1).permute(0, 2, 1)
+
+
+class SpecAug(torch.nn.Module):
+    # https://pytorch.org/audio/master/tutorials/audio_feature_augmentation_tutorial.html#specaugment
+
+    # TODO: move this to dataset.py
 
     def __init__(self):
-        super().__init__(**{
-            'W': 5,  # time warping param
-            'F': config.frequency_mask,  # frequency masking param
-            'T': 0.05,  # time masking param
-            'mF': 1,  # frequency mask num
-            'mT': config.num_time_masks,  # time mask num
-            'batch': True
-        })
+        super().__init__()
+
+        self.warp = torchaudio.transforms.TimeStretch()
+        self.time_mask = [torchaudio.transforms.TimeMasking(time_mask_param=15, p=config.max_time_mask_ratio)] * config.num_time_masks
+        self.freq_mask = torchaudio.transforms.FrequencyMasking(freq_mask_param=config.frequency_mask)
 
     def forward(self, x):
-        x = x.permute(0, 2, 1).unsqueeze(1)
+        # TODO: time_mask_param (max possible length of mask) should be set to p * len(utterance)
 
-        x = super().forward(spec_batch=x)
+        print(x.shape)
+        x = self.warp(x)
+        x = self.time_mask(x)
+        x = self.freq_mask(x)
 
-        return x.squeeze(1).permute(0, 2, 1)
+        return x
 
 
 class Encoder(torch.nn.Module):
@@ -271,11 +298,17 @@ class E2E(torch.nn.Module):
         self.encoder = Encoder()
         self.decoder = Decoder()
 
+    @property
+    def num_params(self):
+        num_params = sum(p.numel() for p in self.parameters())
+
+        return round(num_params / 1_000_000, 1)
+
     def forward(self, x):
         encoder_out = self.encoder(x)
         
         return self.decoder(encoder_out)
-
+    
 
 def main():
     batch_size, num_timesteps = 4, 100
@@ -283,8 +316,7 @@ def main():
 
     model = E2E()
     
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f'Model {config.model_size}: {num_params} total params')
+    print(f'Model {config.model_size}: {model.num_params} million total params')
     
     print(f'Input: {x.shape}')
     output = model(x)
@@ -293,4 +325,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

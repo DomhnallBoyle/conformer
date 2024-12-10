@@ -1,0 +1,4 @@
+librosa==0.10.2
+matplotlib==3.9.3
+torch==2.5.1
+torchaudio==2.5.1
