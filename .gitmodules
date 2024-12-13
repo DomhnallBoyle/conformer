@@ -1,0 +1,3 @@
+[submodule "aiayn"]
+	path = aiayn
+	url = https://github.com/DomhnallBoyle/aiayn.git

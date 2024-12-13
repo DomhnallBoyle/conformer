@@ -1,14 +1,15 @@
+import argparse
 import math
 
+import numpy as np
 import torch
 import torchaudio
 
 import config
-from spec_aug import SpecAugmentTorch
+from dataset import LibriSpeechDataset
+from utils import list_type, plot_mels
 
-
-# TODO: 
-# Use this SpecAugment instead: https://pytorch.org/audio/master/tutorials/audio_feature_augmentation_tutorial.html#specaugment
+# TODO: use model definitions from aiayn model.py instead of redoing
 
 class PermuteLayer(torch.nn.Module):
     
@@ -116,7 +117,7 @@ class PositionalEncoding(torch.nn.Module):
         
         for i in range(config.max_len):
             for j in range(0, config.params['d_encoder'], 2):
-                div_term = 1 / (10000 ** (j / config.params['d_encoder']))
+                div_term = 1 / (10_000 ** (j / config.params['d_encoder']))
                 self.pe[i][j] = math.sin(i * div_term)
                 self.pe[i][j + 1] = math.cos(i * div_term)
 
@@ -201,68 +202,57 @@ class ConformerBlock(torch.nn.Module):
         return x
         
 
-# class SpecAug(SpecAugmentTorch):
-
-#     # spec-aug modifies the spectrogram by warping in the time direction,
-#     # masking blocks of consecutive frequency channels
-#     # and masking blocks of utterances in time
-#     # helps network be more robust to time deformations and partial loss of frequency and segments of speech
-
-#     # TODO: find the correct params for Spec Augment
-
-#     def __init__(self):
-#         super().__init__(**{
-#             'W': 5,  # time warping param
-#             'F': config.frequency_mask,  # frequency masking param
-#             'T': 0.05,  # time masking param
-#             'mF': 1,  # frequency mask num
-#             'mT': config.num_time_masks,  # time mask num
-#             'batch': True
-#         })
-
-#     def forward(self, x):
-#         x = x.permute(0, 2, 1).unsqueeze(1)
-
-#         x = super().forward(spec_batch=x)
-
-#         return x.squeeze(1).permute(0, 2, 1)
-
-
 class SpecAug(torch.nn.Module):
     # https://pytorch.org/audio/master/tutorials/audio_feature_augmentation_tutorial.html#specaugment
 
-    # TODO: move this to dataset.py
-
-    def __init__(self):
+    def __init__(self, debug=False):
         super().__init__()
 
-        self.warp = torchaudio.transforms.TimeStretch()
-        self.time_mask = [torchaudio.transforms.TimeMasking(time_mask_param=15, p=config.max_time_mask_ratio)] * config.num_time_masks
-        self.freq_mask = torchaudio.transforms.FrequencyMasking(freq_mask_param=config.frequency_mask)
+        self.debug = debug
+        self.warp = torchaudio.transforms.TimeStretch(fixed_rate=None, n_freq=config.num_mels)  # stretch in the timestep dimension
+        self.time_masks = [torchaudio.transforms.TimeMasking(time_mask_param=None, p=config.max_time_mask_ratio)] * config.num_time_masks  # add blocks of masks to time dimension
+        self.freq_mask = torchaudio.transforms.FrequencyMasking(freq_mask_param=config.frequency_mask)  # add blocks of masks to freq dimension
 
     def forward(self, x):
-        # TODO: time_mask_param (max possible length of mask) should be set to p * len(utterance)
+        num_timesteps = x.shape[1]
+        x = x.permute(0, 2, 1)  # requires [B, C, T]
 
-        print(x.shape)
-        x = self.warp(x)
-        x = self.time_mask(x)
+        if self.debug:
+            mels = [x[0]]
+
+        # TODO: not sure if casting to complex and back is correct, but complex dtype is required for TimeStretch
+        # use a random warping rate for each iteration
+        x = x.type(torch.complex64)
+        x = self.warp(x, overriding_rate=np.random.uniform(config.min_warp_rate, config.max_warp_rate))
+        x = x.type(torch.float32)
+
+        # update max possible length of time mask to utterance length
+        for time_mask in self.time_masks:
+            time_mask.mask_param = num_timesteps
+            x = time_mask(x)
+
         x = self.freq_mask(x)
 
-        return x
+        if self.debug:
+            mels += [x[0]]
+            plot_mels(mels, ['Before SpecAug', 'After SpecAug'])
+
+        return x.permute(0, 2, 1)
 
 
 class Encoder(torch.nn.Module):
 
-    def __init__(self):
+    def __init__(self, debug=False):
         super().__init__()
 
-        self.spec_aug = SpecAug()
+        self.spec_aug = SpecAug(debug=debug)
         self.linear = torch.nn.Linear(in_features=config.d_features, out_features=config.params['d_encoder'])
         self.dropout = torch.nn.Dropout(p=config.p_drop) 
         self.blocks = torch.nn.Sequential(*[ConformerBlock() for _ in range(config.params['num_encoder_layers'])])
 
-    def forward(self, x):
-        x = self.spec_aug(x)
+    def forward(self, x, training=False):
+        if training:
+            x = self.spec_aug(x)
         x = self.linear(x)
         x = self.dropout(x)
         x = self.blocks(x)
@@ -272,51 +262,76 @@ class Encoder(torch.nn.Module):
 
 class Decoder(torch.nn.Module):
 
-    def __init__(self):
+    def __init__(self, num_classes):
         super().__init__()
 
+        self.num_classes = num_classes
         self.lstm = torch.nn.LSTM(
             input_size=config.params['d_encoder'],
             hidden_size=config.params['d_decoder'],
             num_layers=config.params['num_decoder_layers'],
             bias=True,
-            bidirectional=False,
-            dropout=config.p_drop
+            bidirectional=False
         )
+        self.linear_out = torch.nn.Linear(in_features=config.params['d_decoder'], out_features=num_classes)
+        self.activation_1 = torch.nn.LogSoftmax(dim=2)  # training requires log softmax, inf requires softmax
+        self.activation_2 = torch.nn.Softmax(dim=2)
 
     def forward(self, x):
-        output, (hidden_state, cell_state) = self.lstm(x)
+        x, (hidden_state, cell_state) = self.lstm(x)
+        x = self.linear_out(x)
 
-        return output
+        return self.activation_1(x), self.activation_2(x)
 
 
 class E2E(torch.nn.Module):
     
-    def __init__(self):
+    def __init__(self, num_classes, debug=False):
         super().__init__()
 
-        self.encoder = Encoder()
-        self.decoder = Decoder()
+        print(f'Creating model ({config.model_size})...', end='')
+
+        self.encoder = Encoder(debug=debug)
+        self.decoder = Decoder(num_classes=num_classes)
+
+        print(f'{self.num_params} million total params')
 
     @property
-    def num_params(self):
-        num_params = sum(p.numel() for p in self.parameters())
+    def num_encoder_params(self) -> int:
+        return num_params(self.encoder)
 
-        return round(num_params / 1_000_000, 1)
+    @property
+    def num_decoder_params(self) -> int:
+        return num_params(self.decoder)
 
-    def forward(self, x):
-        encoder_out = self.encoder(x)
+    @property
+    def num_params(self) -> int:
+        return self.num_encoder_params + self.num_decoder_params
+
+    def forward(self, x, training=False):
+        encoder_out = self.encoder(x, training=training)
         
         return self.decoder(encoder_out)
     
 
-def main():
-    batch_size, num_timesteps = 4, 100
-    x = torch.rand((batch_size, num_timesteps, config.d_features))
+def num_params(model: torch.nn.Module) -> float:
+    num_params = sum(p.numel() for p in model.parameters())
 
-    model = E2E()
-    
-    print(f'Model {config.model_size}: {model.num_params} million total params')
+    return round(num_params / 1_000_000, 1)
+
+
+def main(args) -> None:
+    if args.dataset_path:
+        dataset = LibriSpeechDataset(path=args.dataset_path, sets=args.sets)
+        x, _ = dataset[0]
+        x = x.unsqueeze(0)
+    else:
+        batch_size, num_timesteps = 4, 100
+        x = torch.rand((batch_size, num_timesteps, config.d_features))
+
+    model = E2E(debug=args.debug)
+    print(f'Num Encoder params: {model.num_encoder_params} million')
+    print(f'Num Decoder params: {model.num_decoder_params} million')
     
     print(f'Input: {x.shape}')
     output = model(x)
@@ -324,4 +339,9 @@ def main():
     
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset_path')
+    parser.add_argument('--sets', type=list_type)
+    parser.add_argument('--debug', action='store_true')
+
+    main(parser.parse_args())

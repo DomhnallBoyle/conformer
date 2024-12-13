@@ -1,16 +1,22 @@
+import argparse
 from pathlib import Path
 
 import librosa
+import pickle
 import torch
+from tqdm import tqdm
 
 import config
+from utils import list_type
 
 
 class LibriSpeechDataset(torch.utils.data.Dataset):
     
-    def __init__(self, path: str, sets: list[str]) -> None:
+    def __init__(self, path: str, sets: list[str], train: bool = False) -> None:
         self.path = Path(path)
         self.sets = [self.path.joinpath(_set) for _set in sets]
+        self.train = train
+        self.lengths_path = Path('train_lengths.pkl') if train else Path('val_lengths.pkl')
 
         for _set in self.sets:
             if not _set.exists():
@@ -18,12 +24,16 @@ class LibriSpeechDataset(torch.utils.data.Dataset):
                 exit()
 
         self.data = self.get_data()
+        self.lengths = self.get_lengths()
+        self.vocab = self.get_vocab()  # vocab and decoder lookups
+        self.decoder = {v: k for k, v in self.vocab.items()}
+        self.num_classes = len(self.vocab)
 
     def __len__(self) -> int:
         return len(self.data)
 
     def __getitem__(self, index) -> None:
-        _set, audio_name, transcription = self.data[index]
+        _set, audio_name, transcript = self.data[index]
         speaker_id, chapter_id = audio_name.split('-')[:2]
         audio_path = self.path / _set / speaker_id / chapter_id / (audio_name + '.flac')
 
@@ -36,16 +46,19 @@ class LibriSpeechDataset(torch.utils.data.Dataset):
             hop_length=config.stride,
             n_mels=config.num_mels,
         ).T
-        
-        return mel, transcription
 
-    def read_transcription_file(self, path: Path) -> list[list[str]]:
+        # convert transcript to token indices
+        transcript_targets = torch.Tensor([self.vocab[token] for token in transcript.split(' ')])
+
+        return torch.from_numpy(mel), transcript_targets, transcript
+
+    def read_transcript_file(self, path: Path) -> list[list[str]]:
         data = []
         with path.open('r') as f:
             for line in f.read().splitlines():
                 line_split = line.split(' ')
-                audio_name, transcription = line_split[0], ' '.join(line_split[1:])
-                data.append([audio_name, transcription.strip()])
+                audio_name, transcript = line_split[0], ' '.join(line_split[1:])
+                data.append([audio_name, transcript.strip().lower()])
 
         return data
 
@@ -53,18 +66,51 @@ class LibriSpeechDataset(torch.utils.data.Dataset):
         data = []
 
         for _set in self.sets:
-            for transcription_path in _set.rglob('*.trans.txt'):
-                file_data = self.read_transcription_file(path=transcription_path)
+            print('Gathering data from:', _set)
+            for transcript_path in tqdm(_set.rglob('*.trans.txt')):
+                file_data = self.read_transcript_file(path=transcript_path)
                 data.extend([[_set.name] + d for d in file_data])
 
         return data
+    
+    def get_lengths(self) -> dict:
+        print('Extracting dataset lengths...')
+
+        if self.lengths_path.exists():
+            with self.lengths_path.open('rb') as f:
+                return pickle.load(f)
+
+        lengths = {}
+        for i in tqdm(range(len(self))):
+            mel, _ = self[i]
+            lengths[i] = mel.shape[0]
+
+        # cache lengths for later usage
+        with self.lengths_path.open('wb') as f:
+            pickle.dump(lengths, f)
+
+        return lengths
+    
+    def get_vocab(self) -> dict:
+        vocab = set()
+
+        for _, _, transcript in self.data:
+            for token in transcript.split(' '):
+                vocab.add(token)
+
+        # NOTE: excluding blank here (i + 1)
+        return {token: i + 1 for i, token in enumerate(vocab)}
 
 
-def main() -> None:
-    dataset = LibriSpeechDataset(path='LibriSpeech', sets=['dev-clean'])
+def main(args) -> None:
+    dataset = LibriSpeechDataset(path=args.dataset_path, sets=args.sets)
     for i in range(5):
         print(dataset[i])
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('dataset_path')
+    parser.add_argument('sets', type=list_type)
+
+    main(parser.parser_args())
