@@ -51,7 +51,13 @@ params_d = {
 }
 params = params_d.get(model_size, 's')
 
+# aiayn compatibility
+d_model = params['d_encoder']
+d_k, d_v = params['d_attn'], params['d_attn']
+num_heads = params['num_attn_heads']
+
 # mel filterbanks
+sample_rate = 16_000
 window_size = 400  # 25ms window
 stride = 160  # 10ms hop
 num_mels = d_features

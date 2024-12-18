@@ -1,15 +1,12 @@
 import argparse
-import math
 
-import numpy as np
 import torch
-import torchaudio
 
 import config
+from aiayn.model import MultiHeadAttention, PositionalEncoding
 from dataset import LibriSpeechDataset
-from utils import list_type, plot_mels
+from utils import get_num_params, list_type
 
-# TODO: use model definitions from aiayn model.py instead of redoing
 
 class PermuteLayer(torch.nn.Module):
     
@@ -50,81 +47,6 @@ class ConvolutionModule(torch.nn.Module):
         x = self.nn(x)
 
         return x_init + x  # skip connection
-
-
-class ScaledDotProductAttention(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-        self.scale = 1 / math.sqrt(config.params['d_attn'])
-
-    def forward(self, Q, K, V, attn_mask=None):
-        x = Q @ K.transpose(-2, -1)  # matrix dot product, swap dims of value
-        x *= self.scale  # prevents small gradients from softmax
-        if attn_mask is not None:
-            x += attn_mask
-        x = torch.nn.functional.softmax(x, dim=-1)
-        x = x @ V
-
-        return x
-
-
-class MultiHeadAttention(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-        self.num_features = config.params['d_encoder']
-        self.linear_projs_in = torch.nn.ModuleList([
-            torch.nn.ModuleList([
-                torch.nn.Linear(in_features=self.num_features, out_features=config.params['d_attn']),  # Q
-                torch.nn.Linear(in_features=self.num_features, out_features=config.params['d_attn']),  # K
-                torch.nn.Linear(in_features=self.num_features, out_features=config.params['d_attn']),  # V
-            ])
-            for _ in range(config.params['num_attn_heads'])
-        ])
-        self.sdpa = ScaledDotProductAttention()
-        self.linear_out = torch.nn.Linear(in_features=self.num_features, out_features=self.num_features)
-
-    def forward(self, Q, K, V):
-        batch_size, num_timesteps = Q.shape[:2]
-
-        # temp matrices
-        Q_all = torch.zeros((batch_size, config.params['num_attn_heads'], num_timesteps, config.params['d_attn']))
-        K_all = torch.zeros_like(Q_all)
-        V_all = torch.zeros_like(Q_all)
-
-        for i in range(config.params['num_attn_heads']):
-            Q_all[:, i, ...] = self.linear_projs_in[i][0](Q)
-            K_all[:, i, ...] = self.linear_projs_in[i][1](K)
-            V_all[:, i, ...] = self.linear_projs_in[i][2](V)
-
-        x = self.sdpa(Q_all, K_all, V_all)  # parallel
-        x = x.view(batch_size, num_timesteps, config.params['d_attn'] * config.params['num_attn_heads'])  # concat from attn heads
-        x = self.linear_out(x)
-        x = torch.nn.functional.dropout(x, p=config.p_drop, training=True)
-
-        return x
-        
-
-class PositionalEncoding(torch.nn.Module):
-    
-    def __init__(self):
-        super().__init__()
-
-        self.pe = torch.zeros((config.max_len, config.params['d_encoder']))
-        
-        for i in range(config.max_len):
-            for j in range(0, config.params['d_encoder'], 2):
-                div_term = 1 / (10_000 ** (j / config.params['d_encoder']))
-                self.pe[i][j] = math.sin(i * div_term)
-                self.pe[i][j + 1] = math.cos(i * div_term)
-
-    def forward(self, x):
-        x += self.pe[:x.shape[1]]  # inject positional information
-
-        return x
 
 
 class MultiHeadSelfAttentionModule(torch.nn.Module):
@@ -200,59 +122,18 @@ class ConformerBlock(torch.nn.Module):
         x = self.layer_norm(x)
 
         return x
-        
-
-class SpecAug(torch.nn.Module):
-    # https://pytorch.org/audio/master/tutorials/audio_feature_augmentation_tutorial.html#specaugment
-
-    def __init__(self, debug=False):
-        super().__init__()
-
-        self.debug = debug
-        self.warp = torchaudio.transforms.TimeStretch(fixed_rate=None, n_freq=config.num_mels)  # stretch in the timestep dimension
-        self.time_masks = [torchaudio.transforms.TimeMasking(time_mask_param=None, p=config.max_time_mask_ratio)] * config.num_time_masks  # add blocks of masks to time dimension
-        self.freq_mask = torchaudio.transforms.FrequencyMasking(freq_mask_param=config.frequency_mask)  # add blocks of masks to freq dimension
-
-    def forward(self, x):
-        num_timesteps = x.shape[1]
-        x = x.permute(0, 2, 1)  # requires [B, C, T]
-
-        if self.debug:
-            mels = [x[0]]
-
-        # TODO: not sure if casting to complex and back is correct, but complex dtype is required for TimeStretch
-        # use a random warping rate for each iteration
-        x = x.type(torch.complex64)
-        x = self.warp(x, overriding_rate=np.random.uniform(config.min_warp_rate, config.max_warp_rate))
-        x = x.type(torch.float32)
-
-        # update max possible length of time mask to utterance length
-        for time_mask in self.time_masks:
-            time_mask.mask_param = num_timesteps
-            x = time_mask(x)
-
-        x = self.freq_mask(x)
-
-        if self.debug:
-            mels += [x[0]]
-            plot_mels(mels, ['Before SpecAug', 'After SpecAug'])
-
-        return x.permute(0, 2, 1)
 
 
 class Encoder(torch.nn.Module):
 
-    def __init__(self, debug=False):
+    def __init__(self):
         super().__init__()
 
-        self.spec_aug = SpecAug(debug=debug)
         self.linear = torch.nn.Linear(in_features=config.d_features, out_features=config.params['d_encoder'])
         self.dropout = torch.nn.Dropout(p=config.p_drop) 
         self.blocks = torch.nn.Sequential(*[ConformerBlock() for _ in range(config.params['num_encoder_layers'])])
 
-    def forward(self, x, training=False):
-        if training:
-            x = self.spec_aug(x)
+    def forward(self, x):
         x = self.linear(x)
         x = self.dropout(x)
         x = self.blocks(x)
@@ -286,62 +167,64 @@ class Decoder(torch.nn.Module):
 
 class E2E(torch.nn.Module):
     
-    def __init__(self, num_classes, debug=False):
+    def __init__(self, num_classes, group_norm=False):
         super().__init__()
 
         print(f'Creating model ({config.model_size})...', end='')
 
-        self.encoder = Encoder(debug=debug)
+        self.encoder = Encoder()
         self.decoder = Decoder(num_classes=num_classes)
+
+        if group_norm:
+            convert_bn_layer(self)
 
         print(f'{self.num_params} million total params')
 
     @property
     def num_encoder_params(self) -> int:
-        return num_params(self.encoder)
+        return get_num_params(self.encoder)
 
     @property
     def num_decoder_params(self) -> int:
-        return num_params(self.decoder)
+        return get_num_params(self.decoder)
 
     @property
     def num_params(self) -> int:
         return self.num_encoder_params + self.num_decoder_params
 
-    def forward(self, x, training=False):
-        encoder_out = self.encoder(x, training=training)
+    def forward(self, x):
+        encoder_out = self.encoder(x)
         
         return self.decoder(encoder_out)
-    
 
-def num_params(model: torch.nn.Module) -> float:
-    num_params = sum(p.numel() for p in model.parameters())
 
-    return round(num_params / 1_000_000, 1)
+def convert_bn_layer(module: torch.nn.Module) -> None:
+    # TODO: num_groups should be selected automatically -> error when num_channels (features) can't be divided evenly by num_groups
+    # recursive function to convert batch-norm layers to group-norm for gradient accumulation training
+    for name, l in module.named_children():
+        if any([isinstance(l, x) for x in [torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d]]):
+            setattr(module, name, torch.nn.GroupNorm(16, num_channels=l.num_features))
+        if len(list(l.children())) > 0:
+            convert_bn_layer(l)
 
 
 def main(args) -> None:
-    if args.dataset_path:
-        dataset = LibriSpeechDataset(path=args.dataset_path, sets=args.sets)
-        x, _ = dataset[0]
-        x = x.unsqueeze(0)
-    else:
-        batch_size, num_timesteps = 4, 100
-        x = torch.rand((batch_size, num_timesteps, config.d_features))
+    dataset = LibriSpeechDataset(path=args.dataset_path, sets=args.sets)
+    mel = dataset[0][0]
+    mel = mel.unsqueeze(0)  # add batch dimension
 
-    model = E2E(debug=args.debug)
+    model = E2E(num_classes=dataset.num_classes + 1)
     print(f'Num Encoder params: {model.num_encoder_params} million')
     print(f'Num Decoder params: {model.num_decoder_params} million')
     
-    print(f'Input: {x.shape}')
-    output = model(x)
+    print(f'Input: {mel.shape}')
+    output = model(mel)[0]
     print(f'Output: {output.shape}')
-    
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset_path')
-    parser.add_argument('--sets', type=list_type)
-    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('dataset_path')
+    parser.add_argument('sets', type=list_type)
 
     main(parser.parse_args())

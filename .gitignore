@@ -1,4 +1,6 @@
 __pycache__
+runs
 *.tar.gz
 *.pkl
+*.png
 LibriSpeech
